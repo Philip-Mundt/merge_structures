@@ -8,11 +8,10 @@ def assign_segment_ids(universe, protein_name):
     Args:
         universe: MDAnalysis Universe object
         protein_name: Protein identifier (e.g., "hpl2", "lin13")
-        segid_counter: External counter dict to maintain uniqueness across files
     """
     # create a 2 digit short (first character + first number)
     first_letter = protein_name[0]
-    if any(protein_name.isdigit()):
+    if any(c.isdigit for c in protein_name):
         first_digit = next(c for c in protein_name if c.isdigit())
         prefix = first_letter + first_digit
     else: 
@@ -38,7 +37,7 @@ def assign_segment_ids(universe, protein_name):
             seg_id = prefix + str(chain_count).rjust(2, "0")
 
             # update segment ID in the metadata
-            current_seg.atoms.segids = seg_id
+            current_seg.segments.segids = seg_id
 
             # Update for next chain
             chain_start = i
@@ -47,4 +46,6 @@ def assign_segment_ids(universe, protein_name):
     # Get the very last protein chain that the loop finishes on
     last_seg = a[chain_start:]
     seg_id = prefix + str(chain_count).rjust(2, "0")
-    last_seg.segids = seg_id
+    last_seg.segments.segids = seg_id
+
+    return universe
