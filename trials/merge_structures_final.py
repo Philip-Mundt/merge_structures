@@ -5,7 +5,7 @@ import os
 import warnings
 warnings.filterwarnings('ignore')
 
-def assign_segment_ids(universe, protein_name, segid_counter=None):
+def assign_segment_ids(universe, protein_name, existing_segids):
     """
     Assigns unique 4-character segment IDs to protein chains.
     
@@ -15,53 +15,63 @@ def assign_segment_ids(universe, protein_name, segid_counter=None):
     Args:
         universe: MDAnalysis Universe object
         protein_name: Protein identifier (e.g., "hpl2", "lin13")
-        segid_counter: External counter dict to maintain uniqueness across files
+        existing_segids: External counter dict to maintain uniqueness across files -> {protein: (segid, nmb)}
     """
-    if segid_counter is None:
-        segid_counter = {}
-    
-    # Generate 2-character prefix
-    if "hpl" in protein_name.lower():
-        prefix = "HP"
-    elif "met" in protein_name.lower():
-        prefix = "MT"
-    elif "lin13" in protein_name.lower():
-        prefix = "L1"
-    elif "lin65" in protein_name.lower():
-        prefix = "L6"
+    # check if protein is known
+    if protein_name in existing_segids:
+        prefix = existing_segids[protein_name][0]
     else:
-        # Fallback: first letter + first digit or 'X'
-        first_letter = protein_name[0].upper()
-        digits = [c for c in protein_name if c.isdigit()]
-        first_digit = digits[0] if digits else 'X'
-        prefix = f"{first_letter}{first_digit}"
-    
-    # Initialize counter for this prefix
-    if prefix not in segid_counter:
-        segid_counter[prefix] = 1
-    
-    # Identify chains by residue continuity (more reliable than chainID)
-    chains = []
+        # create a 2 digit short (first character + first number)
+        first_letter = protein_name[0]
+        if any(protein_name.isdigit()):
+            first_digit = next(c for c in protein_name if c.isdigit())
+            prefix = first_letter + first_digit
+            if prefix in existing_segids:
+                prefix = protein_name[0:2]
+        else: 
+            prefix = protein_name[0:2]
+        if prefix in existing_segids:
+                prefix = protein_name[1] + "X"
+        if prefix in existing_segids:
+            while True:
+                prefix = input(f"Input a two character short name for the segment IDs of {protein_name}. These names are already taken:")
+                print([x[0] for x in existing_segids.values()])
+
+    a = universe.atoms
+
+    chain_count = existing_segids.get(protein_name, [0, 0])[1] + 1
+    # Track the start position if a new chain
     chain_start = 0
-    
-    for i in range(1, len(universe.atoms)):
-        if universe.atoms[i].resid != universe.atoms[i-1].resid + 1:
-            chains.append(universe.atoms[chain_start:i])
+
+    for i in range(1, len(a)):
+        last = a[i-1]
+        curr = a[i]
+        
+        if last.chainID != curr.chainID:
+            # Slice based on positions in the current AtomGroup
+            current_seg = a[chain_start:i]
+            
+            # Create unique segment name
+            seg_id = prefix + str(chain_count).rjust(2, "0")
+
+            # update segment ID in the metadata
+            current_seg.atoms.segids = seg_id
+
+            # Update for next chain
             chain_start = i
-    
-    # Add final chain
-    chains.append(universe.atoms[chain_start:])
-    
-    # Assign segment IDs
-    for chain in chains:
-        segid = f"{prefix}{segid_counter[prefix]:02d}"
-        chain.segments.segids = segid
-        segid_counter[prefix] += 1
+            chain_count += 1
+
+    # Get the very last protein chain that the loop finishes on
+    last_seg = a[chain_start:]
+    seg_id = prefix + str(chain_count).rjust(2, "0")
+    last_seg.segids = seg_id
+    existing_segids[protein_name] = (prefix, chain_count)
+
+    return universe, existing_segids
 
 def identify_subaggregates(universe, cutoff=15.0):
     """
-    Identifies sub-aggregates within a universe by clustering proteins based on spatial proximity.
-    Handles cases where segment/chain IDs repeat (beyond 26 segments).
+    Identifies sub-aggregates within a universe by clustering proteins based on proximity.
     
     Parameters:
     universe: MDAnalysis Universe containing proteins
@@ -148,24 +158,20 @@ def calculate_condensate_volume(atom_group):
     volume = np.prod(dimensions)
     return volume
 
-def check_collision(atom_group1, atom_group2, min_padding=0.5):
-    """Check if two atom groups collide using bead-specific radii (currently set to 6.0 for all beads)"""
+def check_collision(atom_group1, atom_group2):
+    """Check if two atom groups collide using bead-specific radii (currently set to 5.0 for all beads)"""
     if len(atom_group1) == 0 or len(atom_group2) == 0:
         return False
     
-    # Use bead radius of 6.0 for all beads (as requested by user)
-    bead_radius = 6.0
-    min_required_distance = 2.0 * bead_radius + min_padding  # Sum of radii + padding
+    # Use bead radius of 6.0 for all beads for now
+    bead_radius = 5.0
+    min_required_distance = 2.0 * bead_radius # Sum of radii 
     
-    # Use capped_distance for efficiency
+    # Calculate distance matrix between atoms
     distances = capped_distance(atom_group1.positions, atom_group2.positions, min_required_distance)
     
     # If any distance is less than min_required_distance, there's a collision
     return np.any(distances < min_required_distance)
-
-def get_bead_radius(atom_group):
-    """Get bead radius for an atom group (currently returns 6.0 for all beads)"""
-    return 6.0
 
 def find_optimal_position(positioned_aggregates, new_aggregate, min_distance=5.0, max_attempts=100):
     """Find optimal position for new aggregate to avoid collisions"""
@@ -211,32 +217,15 @@ def find_optimal_position(positioned_aggregates, new_aggregate, min_distance=5.0
     # If no good position found, use default offset
     return np.array([new_size * 2, 0, 0])
 
-def validate_bead_sizes(universes):
-    """Validate that all beads have consistent size (currently 6.0)"""
-    print("\nBead Size Validation:")
-    for i, uni in enumerate(universes):
-        print(f"  Universe {i+1}:")
-        # Get unique residue names
-        residue_names = np.unique(uni.residues.resnames)
-        for resname in residue_names:
-            # Get atoms for this residue type
-            atoms = uni.residues.resnames == resname
-            if np.any(atoms):
-                # All beads in this residue type should have the same size
-                bead_radius = get_bead_radius(uni.atoms[atoms])
-                print(f"    {resname}: bead radius = {bead_radius}")
-    
-    print("  All beads validated with radius = 6.0")
-
 def position_aggregates(universes, min_distance=5.0):
     """Position protein aggregates with minimum separation distance"""
     positioned = []
     
-    for i, uni in enumerate(universes):
+    for i, u in enumerate(universes):
         print(f"Processing universe {i+1}...")
         
         # Identify sub-aggregates
-        subaggregates = identify_subaggregates(uni, cutoff=15.0)
+        subaggregates = identify_subaggregates(u, cutoff=15.0)
         print(f"  Found {len(subaggregates)} sub-aggregates")
         
         # Position each sub-aggregate
@@ -406,7 +395,7 @@ def merge_pdb_files(pdb_files, protein_names, output_path="output/merged_structu
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     
     # Initialize segment ID counter
-    segid_counter = {}
+    existing_segids = {}
     
     # Load and process each universe
     universes = []
@@ -415,17 +404,17 @@ def merge_pdb_files(pdb_files, protein_names, output_path="output/merged_structu
     for pdb_file, protein_name in zip(pdb_files, protein_names):
         try:
             print(f"Loading {pdb_file}...")
-            uni = mda.Universe(pdb_file)
+            u = mda.Universe(pdb_file)
             
             # Assign segment IDs
-            assign_segment_ids(uni, protein_name, segid_counter)
-            print(f"  Assigned segment IDs for {protein_name}")
+            u, existing_segids = assign_segment_ids(u, protein_name, existing_segids)
+            print(f"Assigned segment IDs for {protein_name}")
             
             # Store box dimensions from first file
             if box_dimensions is None:
-                box_dimensions = uni.atoms.dimensions
+                box_dimensions = u.atoms.dimensions
             
-            universes.append(uni)
+            universes.append(u)
             
         except FileNotFoundError:
             print(f"Error: Could not find file {pdb_file}")
@@ -434,9 +423,6 @@ def merge_pdb_files(pdb_files, protein_names, output_path="output/merged_structu
     if len(universes) == 0:
         print("No universes loaded. Exiting.")
         return
-    
-    # Validate bead sizes
-    validate_bead_sizes(universes)
     
     # Position aggregates
     positioned_aggregates = position_aggregates(universes, min_distance)
