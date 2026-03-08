@@ -236,7 +236,7 @@ def place_clusters(target_univ, clusters, z_offset):
         cluster.translate([0, 0, z_offset])
         new_univ = mda.Merge(target_univ.atoms, cluster)
     new_univ.dimenstions = target_univ.dimensions
-    target_univ = new_univ
+    return new_univ
 
 def merge_structures(proteins_df):
     # setup merged universe
@@ -266,6 +266,12 @@ def merge_structures(proteins_df):
 
     while placing_queue_df.shape[0] > 0:
         # figure out which structure to add to the main universe next
+        # Use result_type="expand" to turn the (ratio, dict) tuple into two columns
+        results = placing_queue_df.apply(lambda row: evaluate_structure_fitting(merged, row["subaggregates"], row["n_atoms"]), axis=1, result_type='expand')
+
+        # Assign the expanded columns back to your dataframe
+        placing_queue_df["fit_atoms_ratio"] = results[0]
+        placing_queue_df["fitting_parameters"] = results[1]
         placing_queue_df["fit_atoms_ratio"], placing_queue_df["fitting_parameters"] = placing_queue_df.apply(lambda row: evaluate_structure_fitting(merged, row["subaggregates"], row["n_atoms"]), axis=1)
         # "fitness" describes: the less clusters in the structure the better and the more of the structure's atoms can be placed the better
         placing_queue_df["fitness_score"] = placing_queue_df["fit_atoms_ratio"] / placing_queue_df["n_clusters"]
@@ -273,10 +279,10 @@ def merge_structures(proteins_df):
         
         # first row is to be placed in this iteration
         fitting_parameters = placing_queue_df.iloc[0]["fitting_parameters"]
-        place_clusters(merged, fitting_parameters["fitting_clusters"], fitting_parameters["z_offset"])
+        merged = place_clusters(merged, fitting_parameters["fitting_clusters"], fitting_parameters["z_offset"])
         remaining_clusters.append(fitting_parameters["orphan_clusters"])
 
         # removing the placed universe from the queue
-        placing_queue_df.drop(index=0, inplace=True)
+        placing_queue_df.drop(index=placing_queue_df.index[0], inplace=True)
 
     return merged
