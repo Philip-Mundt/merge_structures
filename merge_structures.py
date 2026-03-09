@@ -193,71 +193,90 @@ def check_placement_feasibility(target_positions, cluster, test_z, box_dims):
     # If len(pairs[0]) is 0, no atoms are within 10A of each other
     return len(pairs[0]) == 0
 
-def evaluate_structure_fitting(target_univ, clusters, n_atoms, v=False):
+def evaluate_structure_fitting(target_univ, clusters, n_atoms, pbar, coarse_step=150, fine_step=20):
     """
-    Evaluates Z-offsets and picks the best one based on atom-ratio/cluster-count.
-    Returns a single dictionary containing the winning parameters.
+    Finds the best Z-offset for a structure using a two-pass search:
+    1. Coarse scan: Quickly find the most promising region of the box.
+    2. Fine tuning: Zoom in on that region for precision placement.
     """
     # Cache the positions of atoms already in the box to speed up checks
     target_pos = target_univ.atoms.positions
     box = target_univ.dimensions
     z_box = int(box[2])
-    total_n_clusters = len(clusters)
+    n_clusters = len(clusters)
+
+    # --- COARSE SCAN ---
+    # use a large step to skip through empty space quickly
 
     # starting fitness score (how well the structure fits at a given z offset)
-    best_fitness_score = -1.0
-    # fefault return if nothing fits
-    best_parameters = {
+    best_coarse_fitness = -1.0
+    best_coarse_z = 0
+
+    # iterate over rough z offsets
+    for z_offset in tqdm(range(0, z_box, coarse_step), desc="scan z offsets", leave=False):
+        fitted_atoms = 0
+        # iterate over all subaggregates in the structure to see if they would fit
+        for cluster in clusters:
+            c_pos = cluster.positions
+            # only check for overlaps in the Z-slice where the cluster will actually sit
+            z_min, z_max = c_pos[:, 2].min() + z_offset - 15.0, c_pos[:, 2].max() + z_offset + 15.0
+            mask = (target_pos[:, 2] >= z_min) & (target_pos[:, 2] <= z_max)
+            
+            # if slice is empty or no collision found
+            if len(target_pos[mask]) == 0 or check_placement_feasibility(target_pos[mask], cluster, z_offset, box):
+                fitted_atoms += len(cluster.atoms)
+        
+        # fitness = (mass placed / total mass) / number of clusters
+        current_fitness = (fitted_atoms / n_atoms) / n_clusters
+        
+        # ensures big clusters that fit are placed first
+        if current_fitness > best_coarse_fitness:
+            best_coarse_fitness = current_fitness
+            best_coarse_z = z_offset
+
+    # --- FINE SCAN ---
+    # fine scan around the best z score from the previous scan
+    fine_start = best_coarse_z - coarse_step
+    fine_end = best_coarse_z + coarse_step
+    
+    # default return if nothing fits
+    best_final_params = {
         "fitting_clusters": [],
         "orphan_clusters": clusters,
         "z_offset": 0,
         "fitness_score": 0.0
     }
-    # iterate over possible z offsets
-    for z_offset in tqdm(range(0, z_box, 50), desc="Testing z_offsets...", leave=False, unit="step"):
-        if v:
-            print(f"Testing z-offset: {z_offset}")
-            print(f"Clusters to test: {len(clusters)}")
-        fitting_clusters = []
-        orphan_clusters = []
-        # iterate over all subaggregates in the structure to see if they would fit
+
+    for z_offset in range(fine_start, fine_end, fine_step):
+        # this time: save the actual clusters that fit
+        current_fitting = []
+        current_orphans = []
+        
         for cluster in clusters:
-            # to tackle performance issues: only check for overlaps in same z-slice as cluster
             c_pos = cluster.positions
-            z_min_query = c_pos[:, 2].min() + z_offset - 15.0
-            z_max_query = c_pos[:, 2].max() + z_offset + 15.0
-            mask = (target_pos[:, 2] >= z_min_query) & (target_pos[:, 2] <= z_max_query)
-            local_target_pos = target_pos[mask]
-
-            # shortcut if z-slice is empty
-            if len(local_target_pos) == 0:
-                fitting_clusters.append(cluster)
+            z_min, z_max = c_pos[:, 2].min() + z_offset - 15.0, c_pos[:, 2].max() + z_offset + 15.0
+            mask = (target_pos[:, 2] >= z_min) & (target_pos[:, 2] <= z_max)
+            
+            if len(target_pos[mask]) == 0 or check_placement_feasibility(target_pos[mask], cluster, z_offset, box):
+                current_fitting.append(cluster)
             else:
-                fits = check_placement_feasibility(local_target_pos, cluster, z_offset, box)
-                if fits:
-                    fitting_clusters.append(cluster)
-                else:
-                    orphan_clusters.append(cluster)
-        if v:
-            print(f"Number of fitting clusters: {len(fitting_clusters)}")
-        # calculate fitness for structure at specific z-offset
-        fit_atoms_count = sum(len(c.atoms) for c in fitting_clusters)
-        fit_atoms_ratio = fit_atoms_count / n_atoms
-        # fitness = placed mass (%) / # of clusters in the structure 
-        # ensures big clusters are placed first so they find place in the box
-        fitness_score = fit_atoms_ratio / total_n_clusters 
-
-
-        if fitness_score > best_fitness_score:
-            best_fitness_score = fitness_score
-            best_parameters = {
-                "fitting_clusters": fitting_clusters,
-                "orphan_clusters": orphan_clusters,
+                current_orphans.append(cluster)
+        
+        fit_ratio = sum(len(c.atoms) for c in current_fitting) / n_atoms
+        final_score = fit_ratio / n_clusters
+        
+        # create dictionary for outputs
+        if final_score > best_final_params["fitness_score"]:
+            best_final_params = {
+                "fitting_clusters": current_fitting,
+                "orphan_clusters": current_orphans,
                 "z_offset": z_offset,
-                "fitness_score": fitness_score
+                "fitness_score": final_score
             }
-                
-    return best_parameters
+    
+    pbar.update(1)
+
+    return best_final_params
 
 def place_clusters(target_univ, clusters, z_offset):
     """
@@ -270,12 +289,10 @@ def place_clusters(target_univ, clusters, z_offset):
     # Collect existing atoms and translated new atoms
     to_combine = [target_univ.atoms]
     for cluster in clusters:
-        c = cluster.center_of_geometry()
-        if (c[2] + z_offset) > max_z:
-            cluster_offset = z_offset - max_z
-        else:
-            cluster_offset = z_offset
-        cluster.translate([0, 0, cluster_offset])
+        current_z = cluster.center_of_geometry()[2]
+        # make sure the structure is set within box boundaries
+        target_z = ((current_z + z_offset) % max_z)
+        cluster.translate([0, 0, target_z - current_z])
         to_combine.append(cluster)
     
     # combine all clusters at once
@@ -284,7 +301,7 @@ def place_clusters(target_univ, clusters, z_offset):
     new_univ.dimensions = target_univ.dimensions
     return new_univ
 
-def merge_structures(proteins_df, v=False):
+def merge_structures(proteins_df):
     """
     Packs structures one-by-one, prioritizing high-mass, low-fragmentation placements.
     """
@@ -297,14 +314,12 @@ def merge_structures(proteins_df, v=False):
     placing_queue_df = placing_queue_df.sort_values(by="n_clusters", ascending=True)
     first_idx = placing_queue_df.index[0]
     merged = placing_queue_df.loc[first_idx, "universe"].copy()    
-    if v:
-        print(f"Initialized the structure with the structure {first_idx} ({placing_queue_df.loc[first_idx, "n_clusters"]} clusters).")
+    print(f"Initialized the structure with {first_idx} ({placing_queue_df.loc[first_idx, "n_clusters"]} clusters).")
 
     # calculate box size of the new universe
     x_dim, y_dim, z_dim = calculate_box_from_condensate(proteins_df)
     merged.dimensions = [x_dim, y_dim, z_dim, 90, 90, 90]
-    if v:
-        print(f"New universe dimensions set at [{x_dim}, {y_dim}, {z_dim}].")
+    print(f"New structure dimensions set at x: {x_dim}, y: {y_dim}, z: {z_dim}.")
 
     # center the first structure in the new big box
     current_c = merged.atoms.center_of_geometry()
@@ -324,16 +339,17 @@ def merge_structures(proteins_df, v=False):
     all_orphan_clusters = []
 
     # progress bar to pass the time
-    pbar_outer = tqdm(total=placing_queue_df.shape[0], desc="Placing Structures...", unit="struct")
+    pbar_outer = tqdm(total=placing_queue_df.shape[0], desc="placing structures", leave=True, unit="struct")
 
     while not placing_queue_df.empty:
-        if v:
-            print(f"Structures yet to set: {placing_queue_df.index}")
+
+        pbar_inner = tqdm(total=placing_queue_df.shape[0], desc="explore structure fit", leave=False, unit="struct")
         # figure out which structure to add to the main universe next
         placing_queue_df["fitness_results"] = placing_queue_df.apply(
-            lambda row: evaluate_structure_fitting(merged, row["subaggregates"], row["n_atoms"], v), 
+            lambda row: evaluate_structure_fitting(merged, row["subaggregates"], row["n_atoms"], pbar_inner), 
             axis=1
         )
+        pbar_inner.close()
         # extract fitness score and sort for the best
         placing_queue_df["current_best_score"] = placing_queue_df["fitness_results"].apply(lambda x: x["fitness_score"])
         placing_queue_df = placing_queue_df.sort_values(by="current_best_score", ascending=False)
@@ -346,8 +362,11 @@ def merge_structures(proteins_df, v=False):
         if fittest_structure["orphan_clusters"]:
             all_orphan_clusters.extend(fittest_structure["orphan_clusters"])
         
-        print(f"Placed {fittest_idx}: {len(fittest_structure['fitting_clusters'])} clusters fit "
-              f"at Z={fittest_structure['z_offset']} (Score: {fittest_structure['fitness_score']:.3f})")
+        # info
+        n_fitting = len(fittest_structure["fitting_clusters"])
+        n_all = n_fitting + len(fittest_structure["orphan_clusters"])
+        pbar_outer.write(f"Placed {fittest_idx}: {n_fitting}/{n_all} clusters fit "
+              f"at Z={fittest_structure["z_offset"]} (Score: {fittest_structure["fitness_score"]:.3f})")
 
         # removing the placed universe from the queue
         placing_queue_df.drop(index=fittest_idx, inplace=True)
