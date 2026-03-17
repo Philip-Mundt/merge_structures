@@ -53,9 +53,25 @@ def calculate_box_from_condensate(proteins_df, sigmas=4):
         z = xy * 9
         return xy, xy, z
 
-def compute_cluster_cylinder(cluster):
-    pos = cluster.positions
-    center = cluster.center_of_geometry()
+def compute_cluster_cylinder(cluster, box):
+    # pos = cluster.positions
+    # center = cluster.center_of_geometry()
+    xdim, ydim, zdim = box[:3]
+    pos = cluster.positions.copy()
+    ref_pos = pos[0]
+    dp = pos - ref_pos
+    # Minimum Image Convention for unwrapping
+    dp[:, 0] -= xdim * np.round(dp[:, 0] / xdim)
+    dp[:, 1] -= ydim * np.round(dp[:, 1] / ydim)
+    dp[:, 2] -= zdim * np.round(dp[:, 2] / zdim)
+    
+    unwrapped_pos = ref_pos + dp
+    # Cylinder dimensions
+    center = np.array([
+        unwrapped_pos[0, :].mean(axis=0),
+        unwrapped_pos[1, :].mean(axis=0),
+        (unwrapped_pos[2, :].min() + unwrapped_pos[2, :].max())/2
+    ])
 
     xy = pos[:, :2] - center[:2]
     radius = np.sqrt((xy**2).sum(axis=1)).max()
@@ -66,67 +82,54 @@ def compute_cluster_cylinder(cluster):
 
     return {
         "cluster": cluster,
-        "com": center,
+        "center": center,
         "radius": radius,
         "height": zmax - zmin
     }
 
 
-def cylinders_overlap(c1, c2, box):
+def cylinders_overlap(c1, c2, box, sigma=5):
+    """
+    Checks if cluster cylinders overlap (plus some buffer for the bead size).
+
+    :param c1: protein cluster to check
+    :type c1: AtomGroup
+    :param c2: protein cluster to check against
+    :type c2: AtomGroup
+    :param box: Box in which both clusters are/should be placed
+    :type box: List/NumPy array
+    :returns: True if clusters overlap, else False
+    :rtype: Bool
+    """
     xdim, ydim, zdim = box[:3]
 
-    dx = c1["x"] - c2["x"]
-    dy = c1["y"] - c2["y"]
-
+    # Distances between centers
+    dx = c1["center"][0] - c2["center"][0]
+    dy = c1["center"][1] - c2["center"][1]
+    dz = c1["center"][2] - c2["center"][2]
+    # Shortest distance across periodic boundaries
     dx -= xdim * np.round(dx/xdim)
     dy -= ydim * np.round(dy/ydim)
+    dz -= zdim * np.round(dz/zdim)
 
     dxy = np.sqrt(dx*dx + dy*dy)
-
-    if dxy >= (c1["radius"] + c2["radius"]):
+    # check xy overlap (+ 2*sigma Å buffer for bead sizes)
+    # if not: no intersection possible
+    if dxy >= (c1["radius"] + c2["radius"] + sigma*2):
         return False
 
-    if c1["z_high"] < c2["z_low"] or c1["z_low"] > c2["z_high"]:
+    # check Z overlap (+ 10 Å buffer for bead sizes)
+    if abs(dz) >= (c1["height"]/2 + c2["height"]/2 + sigma*2):
         return False
-
+    
     return True
 
-#     # Distances between centers
-#     dx = c1["center"][0] - c2["center"][0]
-#     dy = c1["center"][1] - c2["center"][1]
-#     dz = c1["center"][2] - c2["center"][2]
-
-# # Shortest distance across periodic boundaries
-#     dx -= xdim * np.round(dx/xdim)
-#     dy -= ydim * np.round(dy/ydim)
-#     dz -= zdim * np.round(dz/zdim)
-#     # same as:
-#     # dx = dx % xdim
-#     # if dx > xdim/2:
-#     #     dx = xdim - dx
-#     # ...
-
-#     dxy = np.sqrt(dx*dx + dy*dy)
-    
-#     # check xy overlap (+ 10 Å buffer for bead sizes)
-#     # if not: no intersection possible
-#     if dxy >= (c1["radius"] + c2["radius"] + 20):
-#         return False
-
-#     # check Z overlap (+ 10 Å buffer for bead sizes)
-#     if abs(dz) >= (c1["height"]/2 + c2["height"]/2 + 20):
-#         return False
-
-#     return True
-
-
-
-def evaluate_structure_fitting(target_cylinders, clusters, n_atoms, box,
+def evaluate_structure_fitting(target_cylinders, clusters, n_atoms, origin_box, target_box,
                                coarse_step=150, fine_step=20):
 
-    zdim = box[2]
+    zdim = target_box[2]
 
-    cluster_cyl = [compute_cluster_cylinder(c) for c in clusters]
+    cluster_cyl = [compute_cluster_cylinder(c, origin_box) for c in clusters]
 
     def evaluate_z(z_offset, return_clusters=False):
 
@@ -136,22 +139,20 @@ def evaluate_structure_fitting(target_cylinders, clusters, n_atoms, box,
 
         for cyl in cluster_cyl:
 
-            com = cyl["com"]
+            center = cyl["center"]
 
-            z = (com[2] + z_offset) % zdim
+            z = (center[2] + z_offset) % zdim
 
             test_cyl = {
-                "x": com[0],
-                "y": com[1],
+                "center": [center[0], center[1], z],
                 "radius": cyl["radius"],
-                "z_low": z - cyl["height"]/2,
-                "z_high": z + cyl["height"]/2
+                "height": cyl["height"]
             }
 
             collision = False
 
             for placed in target_cylinders:
-                if cylinders_overlap(test_cyl, placed, box):
+                if cylinders_overlap(test_cyl, placed, target_box):
                     collision = True
                     break
 
@@ -246,13 +247,11 @@ def merge_structures(proteins_df):
     placed_cylinders = []
 
     for seg in merged.segments:
-        cyl = compute_cluster_cylinder(seg.atoms)
+        cyl = compute_cluster_cylinder(seg.atoms, [x_dim, y_dim, z_dim])
         placed_cylinders.append({
-            "x": cyl["com"][0],
-            "y": cyl["com"][1],
+            "center": cyl["center"],
             "radius": cyl["radius"],
-            "z_low": cyl["com"][2] - cyl["height"]/2,
-            "z_high": cyl["com"][2] + cyl["height"]/2
+            "height": cyl["height"]
         })
 
     pbar = tqdm(total=len(placing_queue), desc="placing structures")
@@ -264,7 +263,8 @@ def merge_structures(proteins_df):
                 placed_cylinders,
                 row["subaggregates"],
                 row["n_atoms"],
-                [x_dim,y_dim,z_dim]
+                row["box_dimensions"],
+                [x_dim,y_dim,z_dim],
             ),
             axis=1
         )
@@ -284,14 +284,12 @@ def merge_structures(proteins_df):
 
         for cluster in params["fitting_clusters"]:
 
-            cyl = compute_cluster_cylinder(cluster)
+            cyl = compute_cluster_cylinder(cluster, [x_dim, y_dim, z_dim])
 
             placed_cylinders.append({
-                "x": cyl["com"][0],
-                "y": cyl["com"][1],
+                "center": cyl["center"],
                 "radius": cyl["radius"],
-                "z_low": cyl["com"][2] - cyl["height"]/2,
-                "z_high": cyl["com"][2] + cyl["height"]/2
+                "height": cyl["height"]
             })
 
         placing_queue.drop(best, inplace=True)
