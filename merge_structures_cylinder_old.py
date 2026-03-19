@@ -1,7 +1,9 @@
 import numpy as np
 import MDAnalysis as mda
-from tqdm.notebook import tqdm
+from MDAnalysis.lib.distances import capped_distance
 import math
+from tqdm.notebook import tqdm
+
 
 def calculate_box_from_condensate(proteins_df, sigmas=4):
     """
@@ -50,39 +52,65 @@ def calculate_box_from_condensate(proteins_df, sigmas=4):
         xy = np.cbrt(target_volume/9)
         z = xy * 9
         return xy, xy, z
-    
-def place_clusters(target_univ, clusters, z_offset):
-    """
-    Places clusters known to fit into the universe
-    """
-    if not clusters:
-        return target_univ
 
-    # Collect existing atoms and translated new atoms
-    to_combine = [target_univ.atoms]
-    new_placed_clusters = []
-
-    for cluster_dict in clusters:
-        cluster_dict_copy = cluster_dict.copy()
-        cluster_ag = cluster_dict_copy["cluster"]
-        cluster_ag.translate([0, 0, z_offset])
-        to_combine.append(cluster_ag)
-        # update cluster positions also for placed clusters
-        current_center = cluster_dict["center"]
-        cluster_dict_copy["center"] = [current_center[0], current_center[1], (current_center[2] + z_offset) % target_univ.dimensions[2]]
-        new_placed_clusters.append(cluster_dict_copy)
-    # combine all clusters at once
-    new_univ = mda.Merge(*to_combine)
-    # restore original box
-    new_univ.dimensions = target_univ.dimensions
-    # translate overhanging atoms over periodic boundaries 
-    new_univ.atoms.wrap(compound="segments")
-    return new_univ, new_placed_clusters
-
-def cylinders_overlap(c1, c2, box):
+def compute_cluster_cylinder(cluster, box):
     """
-    Checks if two cylinders overlap in a periodic box.
-    Returns True if they overlap and False otherwise.
+    Calculates the metrics of a cylinder around a protein aggregate.
+
+    :param cluster: Protein aggregate to calculate the cylinder for.
+    :type cluster: AtomGroup
+    :param box: Box of the structure the protein cluster is from.
+    :type box: List/NumPy array
+    :returns: dictionary with cluster, center, radius & height of the cylinder
+    :rtype: dict
+    """
+    xdim, ydim, zdim = box[:3]
+    pos = cluster.positions.copy()
+
+    # to calculate the center of the aggregate, it has to be unwrapped along periodic boundaries
+    # to unwrap the aggregate, the shortest distance of all points to a random reference point
+    # in the aggregate is calculated and the atoms arranged around this point
+    # disclaimer: works only if the aggregate spans less then half of the respective box dimension
+    # (otherwise the zylinder might span a lot of empty space)
+    ref_pos = pos[0]
+    dp = pos - ref_pos
+    dp[:, 0] -= xdim * np.round(dp[:, 0] / xdim)
+    dp[:, 1] -= ydim * np.round(dp[:, 1] / ydim)
+    dp[:, 2] -= zdim * np.round(dp[:, 2] / zdim)
+    unwrapped_pos = ref_pos + dp
+
+    # Cylinder dimensions
+    z_min = unwrapped_pos[:, 2].min()
+    z_max = unwrapped_pos[:, 2].max()
+    height = z_max - z_min
+    center = np.array([
+        unwrapped_pos[0, :].mean(axis=0),
+        unwrapped_pos[1, :].mean(axis=0),
+        (z_min + z_max)/2
+    ])
+
+    xy = pos[:, :2] - center[:2]
+    radius = np.sqrt((xy**2).sum(axis=1)).max()
+
+    return {
+        "cluster": cluster,
+        "center": center,
+        "radius": radius,
+        "height": height
+    }
+
+def cylinders_overlap(c1, c2, box, sigma=5):
+    """
+    Checks if cluster cylinders overlap (plus some buffer for the bead size).
+
+    :param c1: protein cluster to check
+    :type c1: AtomGroup
+    :param c2: protein cluster to check against
+    :type c2: AtomGroup
+    :param box: Box in which both clusters are/should be placed
+    :type box: List/NumPy array
+    :returns: True if clusters overlap, else False
+    :rtype: bool
     """
     xdim, ydim, zdim = box[:3]
 
@@ -90,34 +118,29 @@ def cylinders_overlap(c1, c2, box):
     dx = c1["center"][0] - c2["center"][0]
     dy = c1["center"][1] - c2["center"][1]
     dz = c1["center"][2] - c2["center"][2]
-
-# Shortest distance across periodic boundaries
+    # Shortest distance across periodic boundaries
     dx -= xdim * np.round(dx/xdim)
     dy -= ydim * np.round(dy/ydim)
     dz -= zdim * np.round(dz/zdim)
-    # same as:
-    # dx = dx % xdim
-    # if dx > xdim/2:
-    #     dx = xdim - dx
-    # ...
 
     dxy = np.sqrt(dx*dx + dy*dy)
-    
-    # check xy overlap (+ 10 Å buffer for bead sizes)
+    # check xy overlap (+ 2*sigma Å buffer for bead sizes)
     # if not: no intersection possible
-    if dxy >= (c1["radius"] + c2["radius"] + 20):
+    if dxy >= (c1["radius"] + c2["radius"] + sigma*2):
         return False
 
     # check Z overlap (+ 10 Å buffer for bead sizes)
-    if abs(dz) >= (c1["height"]/2 + c2["height"]/2 + 20):
+    if abs(dz) >= (c1["height"]/2 + c2["height"]/2 + sigma*2):
         return False
-
+    
     return True
 
-def evaluate_structure_fitting(target_clusters, clusters, n_atoms, box,
+def evaluate_structure_fitting(target_cylinders, clusters, n_atoms, origin_box, target_box,
                                coarse_step=150, fine_step=20):
 
-    zdim = box[2]
+    zdim = target_box[2]
+
+    cluster_cyl = [compute_cluster_cylinder(c, origin_box) for c in clusters]
 
     def evaluate_z(z_offset, return_clusters=False):
 
@@ -125,31 +148,32 @@ def evaluate_structure_fitting(target_clusters, clusters, n_atoms, box,
         fitting = []
         orphan = []
 
-        for cluster in clusters:
-            center = cluster["center"].copy()
-            # add z offset
-            center[2] = (center[2] + z_offset) % zdim
+        for cyl in cluster_cyl:
+
+            center = cyl["center"]
+
+            z = (center[2] + z_offset) % zdim
 
             test_cyl = {
-                "center": center,
-                "radius": cluster["radius"],
-                "height": cluster["height"]
+                "center": [center[0], center[1], z],
+                "radius": cyl["radius"],
+                "height": cyl["height"]
             }
 
             collision = False
 
-            for placed in target_clusters:
-                if cylinders_overlap(test_cyl, placed, box):
+            for placed in target_cylinders:
+                if cylinders_overlap(test_cyl, placed, target_box):
                     collision = True
                     break
 
             if not collision:
-                fitted_atoms += len(cluster["cluster"].atoms)
+                fitted_atoms += len(cyl["cluster"].atoms)
                 if return_clusters:
-                    fitting.append(cluster)
+                    fitting.append(cyl["cluster"])
             else:
                 if return_clusters:
-                    orphan.append(cluster)
+                    orphan.append(cyl["cluster"])
 
         score = (fitted_atoms / n_atoms) / len(clusters)
 
@@ -178,17 +202,41 @@ def evaluate_structure_fitting(target_clusters, clusters, n_atoms, box,
 
     for z in range(best_z - coarse_step, best_z + coarse_step, fine_step):
 
-        score, fitting, orphan = evaluate_z(z, return_clusters=True)
+        score, fit, orphan = evaluate_z(z, True)
 
         if score > best_params["fitness_score"]:
             best_params = {
                 "fitness_score": score,
                 "z_offset": z,
-                "fitting_clusters": fitting,
+                "fitting_clusters": fit,
                 "orphan_clusters": orphan
             }
 
     return best_params
+
+def place_clusters(target_univ, clusters, offset, independent=False):
+    """
+    Places clusters known to fit into the universe
+    """
+    if not clusters:
+        return target_univ
+    
+    # Collect existing atoms and translated new atoms
+    to_combine = [target_univ.atoms]
+    shift = offset
+    for i in range(len(clusters)):
+        cluster_copy = clusters[i].copy()
+        if independent:
+            shift = offset[i]
+        cluster_copy.translate(shift)
+        to_combine.append(cluster_copy)
+    # combine all clusters at once
+    new_univ = mda.Merge(*to_combine)
+    # restore original box
+    new_univ.dimensions = target_univ.dimensions
+    # translate overhanging atoms over periodic boundaries 
+    new_univ.atoms.wrap(compound="segments")
+    return new_univ
 
 def merge_structures(proteins_df):
 
@@ -196,21 +244,21 @@ def merge_structures(proteins_df):
     x_dim, y_dim, z_dim = calculate_box_from_condensate(proteins_df)
     # ***************************************************
     # Test
-    # x_dim, y_dim, z_dim = box = x_dim, y_dim, 2000
+    x_dim, y_dim, z_dim = x_dim, y_dim, 2000
     # ***************************************************
     print(f"New Structure file initialized with box dimensions [{x_dim}, {y_dim}, {z_dim}].")
 
-    placing_queue = proteins_df.copy()
 
+    placing_queue = proteins_df.copy()
+    # start with the structure with the least clusters
     placing_queue["n_clusters"] = placing_queue["subaggregates"].apply(len)
     placing_queue = placing_queue.sort_values("n_clusters")
 
-    pbar = tqdm(total=len(placing_queue), desc="placing remaining structures")
+    pbar = tqdm(total=len(placing_queue), desc="Placing structures")
 
     first = placing_queue.index[0]
     merged = placing_queue.loc[first,"universe"].copy()
-    first_clusters = placing_queue.loc[first, "subaggregates"]
-    first_box = placing_queue.loc[first, "box_dimensions"]
+    original_box = placing_queue.loc[first, "box_dimensions"]
 
     pbar.write(f"Placed structure {first} ({placing_queue.loc[first, "n_clusters"]} clusters).")
     pbar.update(1)
@@ -219,54 +267,58 @@ def merge_structures(proteins_df):
 
     # changing box dimensions to calculated & centering structures in the new box
     merged.dimensions = [x_dim, y_dim, z_dim, 90, 90, 90]
-    shift = (np.array([x_dim, y_dim, z_dim]) / 2) - (first_box[:3] / 2)
-    merged.atoms.translate(shift)
-    for cluster_data in first_clusters:
-        cluster_data["center"] += shift 
-        # not necessary but maybe will come in handy later (?)
-        cluster_data["cluster"].atoms.translate(shift)
+    merged.atoms.translate((np.array([x_dim, y_dim, z_dim]) / 2) - (original_box[:3] / 2))
+    merged.atoms.wrap(compound="segments")
     for row in placing_queue.itertuples():
         u = row.universe
-        original_box = u.dimensions.copy()
+        orig_box = row.box_dimensions
         u.dimensions = [x_dim, y_dim, z_dim, 90, 90, 90]
-        shift = (np.array([x_dim, y_dim, z_dim]) / 2) - (original_box[:3] / 2)
-        u.atoms.translate(shift)
-        for cluster_data in row.subaggregates:
-            cluster_data["center"] += shift
+        u.atoms.translate((np.array([x_dim, y_dim, z_dim]) / 2) - (orig_box[:3] / 2))
         u.atoms.wrap(compound="segments")
 
-
     # list so collect all clusters placed and those not yet placed
-    placed_clusters = []
-    placed_clusters.extend(first_clusters)
-    orphan_clusters = []
+    placed_cylinders = []
+    orphan_cylinders = []
+
+    for seg in merged.segments:
+        cyl = compute_cluster_cylinder(seg.atoms, [x_dim, y_dim, z_dim])
+        placed_cylinders.append(cyl)
 
     while not placing_queue.empty:
-
+        # check how well and where the remaining structures fit best into the new box
         placing_queue["fitness_results"] = placing_queue.apply(
             lambda row: evaluate_structure_fitting(
-                placed_clusters,
+                placed_cylinders,
                 row["subaggregates"],
                 row["n_atoms"],
-                [x_dim,y_dim,z_dim]
+                row["box_dimensions"],
+                [x_dim,y_dim,z_dim],
             ),
             axis=1
         )
 
-        placing_queue["score"] = placing_queue["fitness_results"].apply(
-            lambda x: x["fitness_score"]
-        )
-
+        # sort the queue to continue placing with the best fitting structure
+        placing_queue["score"] = placing_queue["fitness_results"].apply(lambda x: x["fitness_score"])
         placing_queue = placing_queue.sort_values("score", ascending=False)
-
         best = placing_queue.index[0]
-        params = placing_queue.loc[best,"fitness_results"]
+        fit_dict = placing_queue.loc[best,"fitness_results"]
 
-        merged, new_placed_clusters = place_clusters(merged, params["fitting_clusters"], params["z_offset"])
-        placed_clusters.extend(new_placed_clusters)
-        new_orphan_clusters = params["orphan_clusters"]
-        orphan_clusters.extend(new_orphan_clusters)
-        pbar.write(f"Placed structure {best} ({len(new_placed_clusters)}/{len(new_orphan_clusters) + len(new_placed_clusters)})")
+        # add the fitting clusters of the best fitting structure to the new structure
+        merged = place_clusters(merged, fit_dict["fitting_clusters"], [0, 0, fit_dict["z_offset"]])
+        # calculate cylinders for the placed aggregates in their new place
+        for cluster in fit_dict["fitting_clusters"]:
+            cyl = compute_cluster_cylinder(cluster, [x_dim, y_dim, z_dim])
+            placed_cylinders.append(cyl)
+        
+        for orphan in fit_dict["orphan_clusters"]:
+            # translate orphans too so they stay close to their original position in the structure
+            orphan.translate([0, 0, fit_dict["z_offset"]])
+            orphan.wrap(compound="segments")
+            cyl = compute_cluster_cylinder(orphan, [x_dim, y_dim, z_dim])
+            orphan_cylinders.append(cyl)
+
+        
+        pbar.write(f"Placed structure {best} ({len(fit_dict["fitting_clusters"])}/{len(fit_dict["fitting_clusters"]) + len(fit_dict["orphan_clusters"])})")
 
         placing_queue.drop(best, inplace=True)
 
@@ -274,6 +326,80 @@ def merge_structures(proteins_df):
 
     pbar.close()
 
+    # handle clusters that could not yet be placed
+    # --- ORPHAN HANDLING BLOCK ---
+    n_orphans = len(orphan_cylinders)
+    pbar_orphans = tqdm(total=n_orphans, desc="Fitting orphans")
+    
+    # Sort orphans by cylinder size (largest first)
+    orphan_cylinders.sort(key=lambda x: x["radius"] * x["height"], reverse=True)
+
+    fitting_orphan_offsets = []
+    placed_cylinders_copy = placed_cylinders.copy()
+    for orphan_cyl in orphan_cylinders:
+        success = False
+        # for step_size in [50, 20, 10, 5]:
+        step_size = 50
+        for z_offset in range(0, int(z_dim), step_size):
+            for y_offset in range(0, int(y_dim), step_size):
+                for x_offset in range(0, int(x_dim), step_size):
+                    fits = test_orphan_offset(
+                        cylinder_dict=orphan_cyl, 
+                        target_cylinders=placed_cylinders_copy, 
+                        box=[x_dim, y_dim, z_dim], 
+                        offset=[x_offset, y_offset, z_offset])
+                    if fits:
+                        print(f"Found spot for orphan at {x_offset}, {y_offset}, {z_offset}")
+                        # Create a copy of the dict to avoid modifying the one in orphan_cylinders
+                        placed_cyl = orphan_cyl.copy()
+                        # Apply the offset to the center for future collision checks
+                        new_center = (np.array(orphan_cyl["center"]) + np.array([x_offset, y_offset, z_offset])) % [x_dim, y_dim, z_dim]
+                        placed_cyl["center"] = new_center
+
+                        # collect orphans for later placement
+                        fitting_orphan_offsets.append([x_offset, y_offset, z_offset])
+                        # save the cylinder 
+                        placed_cylinders_copy.append(placed_cyl)
+                        success = True
+                        break
+                if success:
+                    break
+            if success:
+                break
+            # if success:
+            #     break
+        pbar_orphans.update(1)      
+
+    if len(fitting_orphan_offsets) == n_orphans:
+        merged = place_clusters(merged, [cyl["cluster"] for cyl in orphan_cylinders], fitting_orphan_offsets, independent=True)
+        print(f"All {n_orphans} orphan clusters placed.")
+    else:
+        print(f"Only {len(fitting_orphan_offsets)}/{n_orphans} clusters could fit. No clusters placed. ")
+        
+    pbar_orphans.close()
+
     merged.atoms.wrap(compound="segments")
 
     return merged
+
+def test_orphan_offset(cylinder_dict, target_cylinders, box, offset):
+    """
+    Test if a cylinder with a certain offset fits in the current structure.
+
+    """
+    center = np.array(cylinder_dict["center"])
+    center = (center + np.array(offset)) % np.array(box)
+    test_cyl = {
+        "center": center,
+        "radius": cylinder_dict["radius"],
+        "height": cylinder_dict["height"]
+    }
+    fits = True
+
+    for placed in target_cylinders:
+        if cylinders_overlap(test_cyl, placed, box):
+            fits = False
+            break
+
+    return fits
+    

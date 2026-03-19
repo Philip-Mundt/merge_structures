@@ -57,71 +57,67 @@ def place_clusters(target_univ, clusters, z_offset):
     """
     if not clusters:
         return target_univ
-    
+
     # Collect existing atoms and translated new atoms
     to_combine = [target_univ.atoms]
-    for cluster in clusters:
-        cluster_copy = cluster.copy()
-        cluster_copy.translate([0, 0, z_offset])
-        to_combine.append(cluster_copy)
+    new_placed_clusters = []
+
+    for cluster_dict in clusters:
+        cluster_dict_copy = cluster_dict.copy()
+        cluster_ag = cluster_dict_copy["cluster"]
+        cluster_ag.translate([0, 0, z_offset])
+        to_combine.append(cluster_ag)
+        # update cluster positions also for placed clusters
+        current_center = cluster_dict["center"]
+        cluster_dict_copy["center"] = [current_center[0], current_center[1], (current_center[2] + z_offset) % target_univ.dimensions[2]]
+        new_placed_clusters.append(cluster_dict_copy)
     # combine all clusters at once
     new_univ = mda.Merge(*to_combine)
     # restore original box
     new_univ.dimensions = target_univ.dimensions
     # translate overhanging atoms over periodic boundaries 
     new_univ.atoms.wrap(compound="segments")
-    return new_univ
+    return new_univ, new_placed_clusters
 
-def compute_cluster_elliptic_cylinder(cluster):
-
-    pos = cluster.positions
-    com = cluster.center_of_geometry()
-
-    dx = np.abs(pos[:,0] - com[0])
-    dy = np.abs(pos[:,1] - com[1])
-
-    rx = dx.max()
-    ry = dy.max()
-
-    zmin = pos[:,2].min()
-    zmax = pos[:,2].max()
-
-    return {
-        "cluster": cluster,
-        "com": com,
-        "rx": rx,
-        "ry": ry,
-        "height": zmax - zmin
-    }
-
-def elliptic_cylinders_overlap(c1, c2, box):
-
+def cylinders_overlap(c1, c2, box):
+    """
+    Checks if two cylinders overlap in a periodic box.
+    Returns True if they overlap and False otherwise.
+    """
     xdim, ydim, zdim = box[:3]
 
-    dx = c1["x"] - c2["x"]
-    dy = c1["y"] - c2["y"]
+    # Distances between centers
+    dx = c1["center"][0] - c2["center"][0]
+    dy = c1["center"][1] - c2["center"][1]
+    dz = c1["center"][2] - c2["center"][2]
 
+# Shortest distance across periodic boundaries
     dx -= xdim * np.round(dx/xdim)
     dy -= ydim * np.round(dy/ydim)
+    dz -= zdim * np.round(dz/zdim)
+    # same as:
+    # dx = dx % xdim
+    # if dx > xdim/2:
+    #     dx = xdim - dx
+    # ...
 
-    # normalized ellipse distance
-    d = (dx*dx) / ((c1["rx"] + c2["rx"])**2) + \
-        (dy*dy) / ((c1["ry"] + c2["ry"])**2)
-
-    if d >= 1:
+    dxy = np.sqrt(dx*dx + dy*dy)
+    
+    # check xy overlap (+ 10 Å buffer for bead sizes)
+    # if not: no intersection possible
+    if dxy >= (c1["radius"] + c2["radius"] + 20):
         return False
 
-    if c1["z_high"] < c2["z_low"] or c1["z_low"] > c2["z_high"]:
+    # check Z overlap (+ 10 Å buffer for bead sizes)
+    if abs(dz) >= (c1["height"]/2 + c2["height"]/2 + 20):
         return False
 
     return True
 
-def evaluate_structure_fitting(target_cylinders, clusters, n_atoms, box,
+def evaluate_structure_fitting(target_clusters, clusters, n_atoms, box,
                                coarse_step=150, fine_step=20):
 
     zdim = box[2]
-
-    cluster_cyl = [compute_cluster_cylinder(c) for c in clusters]
 
     def evaluate_z(z_offset, return_clusters=False):
 
@@ -129,34 +125,31 @@ def evaluate_structure_fitting(target_cylinders, clusters, n_atoms, box,
         fitting = []
         orphan = []
 
-        for cyl in cluster_cyl:
-
-            com = cyl["com"]
-
-            z = (com[2] + z_offset) % zdim
+        for cluster in clusters:
+            center = cluster["center"].copy()
+            # add z offset
+            center[2] = (center[2] + z_offset) % zdim
 
             test_cyl = {
-                "x": com[0],
-                "y": com[1],
-                "radius": cyl["radius"],
-                "z_low": z - cyl["height"]/2,
-                "z_high": z + cyl["height"]/2
+                "center": center,
+                "radius": cluster["radius"],
+                "height": cluster["height"]
             }
 
             collision = False
 
-            for placed in target_cylinders:
+            for placed in target_clusters:
                 if cylinders_overlap(test_cyl, placed, box):
                     collision = True
                     break
 
             if not collision:
-                fitted_atoms += len(cyl["cluster"].atoms)
+                fitted_atoms += len(cluster["cluster"].atoms)
                 if return_clusters:
-                    fitting.append(cyl["cluster"])
+                    fitting.append(cluster)
             else:
                 if return_clusters:
-                    orphan.append(cyl["cluster"])
+                    orphan.append(cluster)
 
         score = (fitted_atoms / n_atoms) / len(clusters)
 
@@ -185,13 +178,13 @@ def evaluate_structure_fitting(target_cylinders, clusters, n_atoms, box,
 
     for z in range(best_z - coarse_step, best_z + coarse_step, fine_step):
 
-        score, fit, orphan = evaluate_z(z, True)
+        score, fitting, orphan = evaluate_z(z, return_clusters=True)
 
         if score > best_params["fitness_score"]:
             best_params = {
                 "fitness_score": score,
                 "z_offset": z,
-                "fitting_clusters": fit,
+                "fitting_clusters": fitting,
                 "orphan_clusters": orphan
             }
 
@@ -199,42 +192,60 @@ def evaluate_structure_fitting(target_cylinders, clusters, n_atoms, box,
 
 def merge_structures(proteins_df):
 
+    # calculate box dimensions for the new structure
+    x_dim, y_dim, z_dim = calculate_box_from_condensate(proteins_df)
+    # ***************************************************
+    # Test
+    # x_dim, y_dim, z_dim = box = x_dim, y_dim, 2000
+    # ***************************************************
+    print(f"New Structure file initialized with box dimensions [{x_dim}, {y_dim}, {z_dim}].")
+
     placing_queue = proteins_df.copy()
 
     placing_queue["n_clusters"] = placing_queue["subaggregates"].apply(len)
     placing_queue = placing_queue.sort_values("n_clusters")
 
+    pbar = tqdm(total=len(placing_queue), desc="placing remaining structures")
+
     first = placing_queue.index[0]
     merged = placing_queue.loc[first,"universe"].copy()
+    first_clusters = placing_queue.loc[first, "subaggregates"]
+    first_box = placing_queue.loc[first, "box_dimensions"]
+
+    pbar.write(f"Placed structure {first} ({placing_queue.loc[first, "n_clusters"]} clusters).")
+    pbar.update(1)
 
     placing_queue.drop(first, inplace=True)
 
-    x_dim, y_dim, z_dim = calculate_box_from_condensate(proteins_df)
-    merged.dimensions = [x_dim,y_dim,z_dim,90,90,90]
+    # changing box dimensions to calculated & centering structures in the new box
+    merged.dimensions = [x_dim, y_dim, z_dim, 90, 90, 90]
+    shift = (np.array([x_dim, y_dim, z_dim]) / 2) - (first_box[:3] / 2)
+    merged.atoms.translate(shift)
+    for cluster_data in first_clusters:
+        cluster_data["center"] += shift 
+        # not necessary but maybe will come in handy later (?)
+        cluster_data["cluster"].atoms.translate(shift)
+    for row in placing_queue.itertuples():
+        u = row.universe
+        original_box = u.dimensions.copy()
+        u.dimensions = [x_dim, y_dim, z_dim, 90, 90, 90]
+        shift = (np.array([x_dim, y_dim, z_dim]) / 2) - (original_box[:3] / 2)
+        u.atoms.translate(shift)
+        for cluster_data in row.subaggregates:
+            cluster_data["center"] += shift
+        u.atoms.wrap(compound="segments")
 
-    merged.atoms.translate([
-        x_dim/2, y_dim/2, z_dim/2
-    ] - merged.atoms.center_of_geometry())
 
-    placed_cylinders = []
-
-    for seg in merged.segments:
-        cyl = compute_cluster_cylinder(seg.atoms)
-        placed_cylinders.append({
-            "x": cyl["com"][0],
-            "y": cyl["com"][1],
-            "radius": cyl["radius"],
-            "z_low": cyl["com"][2] - cyl["height"]/2,
-            "z_high": cyl["com"][2] + cyl["height"]/2
-        })
-
-    pbar = tqdm(total=len(placing_queue), desc="placing structures")
+    # list so collect all clusters placed and those not yet placed
+    placed_clusters = []
+    placed_clusters.extend(first_clusters)
+    orphan_clusters = []
 
     while not placing_queue.empty:
 
         placing_queue["fitness_results"] = placing_queue.apply(
             lambda row: evaluate_structure_fitting(
-                placed_cylinders,
+                placed_clusters,
                 row["subaggregates"],
                 row["n_atoms"],
                 [x_dim,y_dim,z_dim]
@@ -251,21 +262,11 @@ def merge_structures(proteins_df):
         best = placing_queue.index[0]
         params = placing_queue.loc[best,"fitness_results"]
 
-        merged = place_clusters(merged,
-                                params["fitting_clusters"],
-                                params["z_offset"])
-
-        for cluster in params["fitting_clusters"]:
-
-            cyl = compute_cluster_cylinder(cluster)
-
-            placed_cylinders.append({
-                "x": cyl["com"][0],
-                "y": cyl["com"][1],
-                "radius": cyl["radius"],
-                "z_low": cyl["com"][2] - cyl["height"]/2,
-                "z_high": cyl["com"][2] + cyl["height"]/2
-            })
+        merged, new_placed_clusters = place_clusters(merged, params["fitting_clusters"], params["z_offset"])
+        placed_clusters.extend(new_placed_clusters)
+        new_orphan_clusters = params["orphan_clusters"]
+        orphan_clusters.extend(new_orphan_clusters)
+        pbar.write(f"Placed structure {best} ({len(new_placed_clusters)}/{len(new_orphan_clusters) + len(new_placed_clusters)})")
 
         placing_queue.drop(best, inplace=True)
 

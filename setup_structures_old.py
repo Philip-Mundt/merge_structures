@@ -109,38 +109,12 @@ def identify_subaggregates(universe, cutoff=15.0):
     graph = csr_matrix(adj)
     n_clusters, labels = connected_components(graph)
 
-    # 5. Group into AtomGroups & calculate cylinders
-    xdim, ydim, zdim = box[:3]
+    # 5. Group into AtomGroups
     subaggregates = []
     for i in range(n_clusters):
         cluster_indices = np.where(labels == i)[0]
         # Summing AtomGroups to create a single combined AtomGroup
         cluster_ag = sum(prots[idx] for idx in cluster_indices)
-
-        # find true center respecting periodic boundaries
-        pos = cluster_ag.positions.copy()
-        ref_pos = pos[0]
-        dp = pos - ref_pos
-        # Minimum Image Convention for unwrapping
-        dp[:, 0] -= xdim * np.round(dp[:, 0] / xdim)
-        dp[:, 1] -= ydim * np.round(dp[:, 1] / ydim)
-        dp[:, 2] -= zdim * np.round(dp[:, 2] / zdim)
-        
-        unwrapped_pos = ref_pos + dp
-        # Cylinder dimensions
-        center = np.array([
-            unwrapped_pos[0, :].mean(axis=0),
-            unwrapped_pos[1, :].mean(axis=0),
-            (unwrapped_pos[2, :].min() + unwrapped_pos[2, :].max())/2
-        ])
-        height = unwrapped_pos[:, 2].max() - unwrapped_pos[:, 2].min()
-        radius = np.sqrt(np.sum((unwrapped_pos[:, :2] - center[:2])**2, axis=1)).max()
-
-        subaggregates.append({
-            "cluster": cluster_ag,
-            "center": [center[0] % xdim, center[1] % ydim, center[2] % zdim],
-            "radius": radius,
-            "height": height
-        })
+        subaggregates.append(cluster_ag)
 
     return subaggregates
