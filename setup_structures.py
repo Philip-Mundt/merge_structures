@@ -8,42 +8,25 @@ def assign_segment_ids(universe, protein_name, existing_segids={}):
     """
     Assigns unique 4-character segment IDs to protein chains.
     
-    Format: [Protein Type][Chain Number] (e.g., H201, L101)
+    Format: Single character [A-Z, a-z][Chain Number] (e.g., A001, F641)
     Handles cases where chain IDs repeat in input PDBs.
     
     Args:
         universe: MDAnalysis Universe object
         protein_name: Protein identifier (e.g., "hpl2", "lin13")
-        existing_segids: External counter dict to maintain uniqueness across files -> {protein: (segid, nmb)}
+        existing_segids: External counter dict to maintain uniqueness across files -> {protein: (prefix, nmb)}
     """
-    up_protein_name = protein_name.upper()
-    # check if protein is known
-    if protein_name in existing_segids:
+    prefix_chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+    if protein_name in existing_segids.keys():
         prefix = existing_segids[protein_name][0]
+        chain_count = existing_segids[protein_name][1] + 1
     else:
-        # create a 2 digit short (first character + first number)
-        first_letter = up_protein_name[0]
-        if any(c.isdigit() for c in protein_name):
-            first_digit = next(c for c in protein_name if c.isdigit())
-            prefix = first_letter + first_digit
-            if prefix in existing_segids:
-                prefix = up_protein_name[0:2]
-        else: 
-            prefix = up_protein_name[0:2]
-        if prefix in existing_segids:
-                prefix = up_protein_name[0] + "X"
-        if prefix in existing_segids:
-            while True:
-                prefix = input(f"Input a two character short name for the segment IDs of {protein_name}. These names are already taken:")
-                print([x[0] for x in existing_segids.values()])
-                if len(prefix) == 2:
-                    break
-                else:
-                    print("Invalid input, try again")
+        prefix = prefix_chars[len(existing_segids)]
+        chain_count = 1
 
     a = universe.atoms
 
-    chain_count = existing_segids.get(protein_name, [0, 0])[1] + 1
+
     # Track the start position if a new chain
     chain_start = 0
 
@@ -55,7 +38,7 @@ def assign_segment_ids(universe, protein_name, existing_segids={}):
             # Slice based on positions in the current AtomGroup
             current_seg = a[chain_start:i]
             
-            seg_id = f"{prefix}{chain_count:02d}"
+            seg_id = f"{prefix}{chain_count:03d}"
             # create new segment
             new_seg = universe.add_Segment(segid=seg_id)
 
@@ -68,9 +51,10 @@ def assign_segment_ids(universe, protein_name, existing_segids={}):
 
     # Get the very last protein chain that the loop finishes on
     last_seg = a[chain_start:]
-    seg_id = f"{prefix}{chain_count:02d}"
+    seg_id = f"{prefix}{chain_count:03d}"
     new_seg = universe.add_Segment(segid=seg_id)
     last_seg.residues.segments = new_seg
+
     existing_segids[protein_name] = (prefix, chain_count)
     
     # rebuild universe to clean empty segments
@@ -115,8 +99,7 @@ def identify_subaggregates(universe, cutoff=15.0):
     for i in range(n_clusters):
         cluster_indices = np.where(labels == i)[0]
         # Summing AtomGroups to create a single combined AtomGroup
-        cluster_ag = sum(prots[idx] for idx in cluster_indices)
-
+        cluster_ag = mda.Merge(*[prots[idx] for idx in cluster_indices]).atoms
         # to calculate the center of the aggregate, it has to be unwrapped along periodic boundaries
         # to unwrap the aggregate, the shortest distance of all points to a random reference point
         # in the aggregate is calculated and the atoms arranged around this point

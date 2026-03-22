@@ -284,7 +284,7 @@ def merge_structures(proteins_df):
         for orphan in fit_dict["orphan_clusters"]:
             # translate orphans too so they stay close to their original position in the structure
             orphan["cluster"].translate([0, 0, fit_dict["z_offset"]])
-            orphan["cluster"].wrap(compound="atoms")
+            orphan["cluster"].wrap(compound="atoms", box=[box[0], box[1], box[2], 90, 90, 90])
             center = orphan["center"]
             new_center = (np.array(center) + np.array([0, 0, fit_dict["z_offset"]])) % box
             orphan["center"] = new_center 
