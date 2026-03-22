@@ -39,7 +39,7 @@ def assign_segment_ids(universe, protein_name, existing_segids={}):
                 if len(prefix) == 2:
                     break
                 else:
-                    print("INvalid input, try again")
+                    print("Invalid input, try again")
 
     a = universe.atoms
 
@@ -76,7 +76,7 @@ def assign_segment_ids(universe, protein_name, existing_segids={}):
     # rebuild universe to clean empty segments
     universe = mda.Merge(a)
 
-    return universe
+    return universe, prefix
 
 def identify_subaggregates(universe, cutoff=15.0):
     """
@@ -135,8 +135,8 @@ def identify_subaggregates(universe, cutoff=15.0):
         z_max = unwrapped_pos[:, 2].max()
         height = z_max - z_min
         center = np.array([
-            unwrapped_pos[0, :].mean(axis=0),
-            unwrapped_pos[1, :].mean(axis=0),
+            unwrapped_pos[:, 0].mean(axis=0),
+            unwrapped_pos[:, 1].mean(axis=0),
             (z_min + z_max)/2
         ])
         radius = np.sqrt(np.sum((unwrapped_pos[:, :2] - center[:2])**2, axis=1)).max()
