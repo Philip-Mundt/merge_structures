@@ -54,7 +54,7 @@ def calculate_box_from_condensate(proteins_df, sigmas=4):
         z = xy * 9
         return xy, xy, z
 
-def cylinders_overlap(c1, c2, box, sigma=5):
+def cylinders_overlap(c1, c2, box, sigma=6):
     """
     Checks if cluster cylinders overlap (plus some buffer for the bead size).
 
@@ -371,7 +371,7 @@ def find_orphan_placement(orphan_cylinders, placed_cylinders, box, thorough=Fals
  
     return fitting_orphans, misfit_orphans
 
-def test_orphan_offset(cylinder_dict, target_cylinders, box, offset, sigma=5, thorough=False):
+def test_orphan_offset(cylinder_dict, target_cylinders, box, offset, sigma=6, thorough=False):
     """
     Test if a cylinder with a certain offset fits in the current structure.
 
@@ -397,7 +397,7 @@ def test_orphan_offset(cylinder_dict, target_cylinders, box, offset, sigma=5, th
                 pairs = capped_distance(
                     reference=placed["cluster"], 
                     configuration=test_cyl["cluster"], 
-                    max_cutoff=sigma*2.5, 
+                    max_cutoff=sigma*2, 
                     box=[box[0], box[1], box[2], 90, 90, 90]
                     )
                 if len(pairs[0]) == 0:

@@ -67,6 +67,7 @@ def identify_subaggregates(universe, cutoff=15.0):
     Clusters proteins if any bead of one is within 'cutoff' of any bead of another.
     """
     # 1. Collect all non-empty protein groups
+    segments = [s for s in universe.segments if len(s.atoms) > 0]
     prots = [s.atoms for s in universe.segments if len(s.atoms) > 0]
     n_prots = len(prots)
     if n_prots == 0: return []
@@ -98,6 +99,8 @@ def identify_subaggregates(universe, cutoff=15.0):
     subaggregates = []
     for i in range(n_clusters):
         cluster_indices = np.where(labels == i)[0]
+
+        seg_list = [segments[idx].segid for idx in cluster_indices]
         # Summing AtomGroups to create a single combined AtomGroup
         cluster_ag = mda.Merge(*[prots[idx] for idx in cluster_indices]).atoms
         # to calculate the center of the aggregate, it has to be unwrapped along periodic boundaries
@@ -126,6 +129,7 @@ def identify_subaggregates(universe, cutoff=15.0):
 
         subaggregates.append({
             "cluster": cluster_ag,
+            "segIDs": seg_list,
             "center": center,
             "radius": radius,
             "height": height
