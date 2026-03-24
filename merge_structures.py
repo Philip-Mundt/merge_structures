@@ -291,7 +291,7 @@ def merge_structures(proteins_df):
             orphan_cylinders.append(orphan)
 
         
-        pbar.write(f"Placed structure {best} ({len(fit_dict["fitting_clusters"])}/{len(fit_dict["fitting_clusters"]) + len(fit_dict["orphan_clusters"])})")
+        pbar.write(f"Placed structure {best} ({len(fit_dict["fitting_clusters"])}/{len(fit_dict["fitting_clusters"]) + len(fit_dict["orphan_clusters"])} clusters).")
 
         placing_queue.drop(best, inplace=True)
 
